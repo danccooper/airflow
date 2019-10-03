@@ -15,11 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 """Executes task in a Kubernetes POD"""
+import re
 from airflow.exceptions import AirflowException
 from airflow.models import BaseOperator
 from airflow.utils.decorators import apply_defaults
 from airflow.contrib.kubernetes import kube_client, pod_generator, pod_launcher
-from airflow.contrib.kubernetes.pod import Resources
+from airflow.contrib.kubernetes.pod import Pod, Resources
 from airflow.utils.state import State
 
 
@@ -109,50 +110,85 @@ class KubernetesPodOperator(BaseOperator):  # pylint: disable=too-many-instance-
             client = kube_client.get_kube_client(in_cluster=self.in_cluster,
                                                  cluster_context=self.cluster_context,
                                                  config_file=self.config_file)
-            gen = pod_generator.PodGenerator()
 
-            for port in self.ports:
-                gen.add_port(port)
-            for mount in self.volume_mounts:
-                gen.add_mount(mount)
-            for volume in self.volumes:
-                gen.add_volume(volume)
+            # Add combination of labels to uniquely identify a running pod
+            labels = {
+                'dag_id': context['dag'].dag_id,
+                'task_id': context['task'].task_id,
+                'exec_date': context['ts']
+            }
+            # In the case of sub dags this is just useful
+            if context['dag'].parent_dag:
+                labels['parent_dag_id'] = context['dag'].parent_dag.dag_id
+            # Replace unsupported characters with dashes & trim at 63 chars (max allowed)
+            for label_id, label in labels.items():
+                label = re.sub(r'[^-A-Za-z0-9_.]+', '-', label)[:63]
+                label = re.sub(r'[^A-Za-z0-9]+$', '', label)
+                labels[label_id] = re.sub(r'^[^A-Za-z0-9]+', '', label)
 
-            pod = gen.make_pod(
-                namespace=self.namespace,
-                image=self.image,
-                pod_id=self.name,
-                cmds=self.cmds,
-                arguments=self.arguments,
-                labels=self.labels,
-            )
+            label_selector = ','.join([label_id + '=' + label for label_id, label in labels.items()])
 
-            pod.service_account_name = self.service_account_name
-            pod.secrets = self.secrets
-            pod.envs = self.env_vars
-            pod.image_pull_policy = self.image_pull_policy
-            pod.image_pull_secrets = self.image_pull_secrets
-            pod.annotations = self.annotations
-            pod.resources = self.resources
-            pod.affinity = self.affinity
-            pod.node_selectors = self.node_selectors
-            pod.hostnetwork = self.hostnetwork
-            pod.tolerations = self.tolerations
-            pod.configmaps = self.configmaps
-            pod.security_context = self.security_context
-            pod.pod_runtime_info_envs = self.pod_runtime_info_envs
-            pod.dnspolicy = self.dnspolicy
+            pod_list = client.list_namespaced_pod(self.namespace, label_selector=label_selector)
+
+            if len(pod_list.items) > 1:
+                raise AirflowException(
+                    'More than one pod running with labels: {label_selector}'.format(label_selector=label_selector))
 
             launcher = pod_launcher.PodLauncher(kube_client=client,
                                                 extract_xcom=self.xcom_push)
-            try:
-                (final_state, result) = launcher.run_pod(
-                    pod,
-                    startup_timeout=self.startup_timeout_seconds,
-                    get_logs=self.get_logs)
-            finally:
-                if self.is_delete_operator_pod:
-                    launcher.delete_pod(pod)
+
+            if len(pod_list.items) == 1:
+                pod = Pod(image=self.image, envs={}, cmds=self.cmds,
+                          name=pod_list.items[0].metadata.name, namespace=self.namespace)
+                try:
+                    (final_state, result) = launcher._monitor_pod(pod, get_logs=self.get_logs)
+                finally:
+                    if self.is_delete_operator_pod:
+                        launcher.delete_pod(pod)
+            else:
+                gen = pod_generator.PodGenerator()
+
+                for port in self.ports:
+                    gen.add_port(port)
+                for mount in self.volume_mounts:
+                    gen.add_mount(mount)
+                for volume in self.volumes:
+                    gen.add_volume(volume)
+
+                self.labels.update(labels)
+
+                pod = gen.make_pod(
+                    namespace=self.namespace,
+                    image=self.image,
+                    pod_id=self.name,
+                    cmds=self.cmds,
+                    arguments=self.arguments,
+                    labels=self.labels,
+                )
+
+                pod.service_account_name = self.service_account_name
+                pod.secrets = self.secrets
+                pod.envs = self.env_vars
+                pod.image_pull_policy = self.image_pull_policy
+                pod.image_pull_secrets = self.image_pull_secrets
+                pod.annotations = self.annotations
+                pod.resources = self.resources
+                pod.affinity = self.affinity
+                pod.node_selectors = self.node_selectors
+                pod.hostnetwork = self.hostnetwork
+                pod.tolerations = self.tolerations
+                pod.configmaps = self.configmaps
+                pod.security_context = self.security_context
+                pod.pod_runtime_info_envs = self.pod_runtime_info_envs
+                pod.dnspolicy = self.dnspolicy
+                try:
+                    (final_state, result) = launcher.run_pod(
+                        pod,
+                        startup_timeout=self.startup_timeout_seconds,
+                        get_logs=self.get_logs)
+                finally:
+                    if self.is_delete_operator_pod:
+                        launcher.delete_pod(pod)
 
             if final_state != State.SUCCESS:
                 raise AirflowException(
